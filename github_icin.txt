@@ -1,0 +1,2187 @@
+# ============================================================
+# TDVRP OPTIMIZED ONLY - FIRST 2 WEEKS / NO TIME LIMIT / PRODUCT-SPECIFIC PENALTY
+# Time system in the mathematical model:
+# 09:00 = 0, 12:00 = 180, 18:00 = 540
+#
+# Optimized-only run for TESTDATASI07_real_verilerle.xlsx format:
+# nodes sheet, vehicles sheet, products sheet, days_sheet,
+# service_time sheet, time_windows sheet,
+# vrp_input_product_based sheet, travel_time_* sheets
+# ============================================================
+
+# ============================================================
+# 0. GUROBI LICENSE SETUP - RUN FIRST AFTER COLAB RESTART
+# ============================================================
+
+import os
+import sys
+import shutil
+import subprocess
+
+# If you already set the Gurobi license in another cell, change this to False.
+UPLOAD_GUROBI_LICENSE = True
+
+try:
+    from google.colab import files
+    IN_COLAB = True
+except Exception:
+    IN_COLAB = False
+
+if IN_COLAB and UPLOAD_GUROBI_LICENSE:
+    print("Please upload your gurobi.lic file first.")
+    uploaded_license = files.upload()
+    license_file = list(uploaded_license.keys())[0]
+
+    print("Uploaded license file:", license_file)
+
+    license_path = "/root/gurobi.lic"
+    shutil.copy(license_file, license_path)
+    os.environ["GRB_LICENSE_FILE"] = license_path
+
+    print("GRB_LICENSE_FILE =", os.environ["GRB_LICENSE_FILE"])
+
+# ============================================================
+# 1. INSTALL / IMPORT LIBRARIES
+# ============================================================
+
+try:
+    import gurobipy as gp
+    from gurobipy import GRB
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "gurobipy"])
+    import gurobipy as gp
+    from gurobipy import GRB
+
+import math
+import pandas as pd
+
+# Start Gurobi environment.
+# If you use a local academic license, this also works.
+try:
+    gp.disposeDefaultEnv()
+except Exception:
+    pass
+
+try:
+    gurobi_env = gp.Env(empty=True)
+    gurobi_env.start()
+    print("Gurobi environment started successfully.")
+except Exception as e:
+    print("Could not start explicit Gurobi environment.")
+    print("Trying default environment instead.")
+    gurobi_env = None
+
+# ============================================================
+# 2. UPLOAD / READ EXCEL FILE
+# ============================================================
+
+if IN_COLAB:
+    print("\nPlease upload TESTDATASI07.xlsx now.")
+    uploaded_excel = files.upload()
+    FILE = list(uploaded_excel.keys())[0]
+else:
+    FILE = "TESTDATASI07.xlsx"
+
+DEPOT_NAME = "solmaz_depo"
+
+print("\nUsing file:", FILE)
+
+# ============================================================
+# 3. HELPER FUNCTIONS
+# ============================================================
+
+def clean_columns(df):
+    df.columns = (
+        df.columns
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_", regex=False)
+    )
+    return df
+
+
+def strip_values(df):
+    """Strip text cells without turning real NaN values into the string 'nan'."""
+    for col in df.columns:
+        if df[col].dtype == "object":
+            df[col] = df[col].map(lambda x: x.strip() if isinstance(x, str) else x)
+    return df
+
+
+def drop_empty_rows(df):
+    """Remove fully empty rows that can appear because Excel sheets are formatted below the data."""
+    df = df.replace(r"^\s*$", pd.NA, regex=True)
+    return df.dropna(how="all").copy()
+
+
+def clean_id(x):
+    """Keeps product/store/vehicle ids clean. Example: 10481.0 -> 10481."""
+    if pd.isna(x):
+        return ""
+    s = str(x).strip()
+    if s.lower() in ["nan", "none", "nat"]:
+        return ""
+    if s.endswith(".0"):
+        before = s[:-2]
+        if before.replace("-", "").isdigit():
+            s = before
+    return s
+
+
+def norm_key(x):
+    """Case-insensitive matching key for product/store ids."""
+    return clean_id(x).casefold()
+
+
+def check_required_columns(df, required_cols, sheet_name):
+    missing = [col for col in required_cols if col not in df.columns]
+    if missing:
+        print(f"\nHATA: '{sheet_name}' içinde eksik sütunlar var:")
+        print(missing)
+        print("\nBu sheet'teki mevcut sütunlar:")
+        print(df.columns.tolist())
+        raise KeyError(f"{sheet_name} içinde eksik sütunlar: {missing}")
+
+
+def safe_read_excel(file, sheet_name, **kwargs):
+    try:
+        return pd.read_excel(file, sheet_name=sheet_name, **kwargs)
+    except Exception as e:
+        print(f"\nHATA: '{sheet_name}' sheet'i okunamadı.")
+        print("Excel dosyasındaki sheet adlarını kontrol et.")
+        raise e
+
+
+def relative_min_to_clock(mins):
+    """
+    Model time is relative to 09:00.
+    Example:
+    0   -> 09:00
+    180 -> 12:00
+    540 -> 18:00
+    """
+    if mins is None:
+        return None
+    try:
+        if pd.isna(mins):
+            return None
+    except Exception:
+        pass
+
+    absolute = float(mins) + 9 * 60
+    hours = int(absolute // 60)
+    minutes = int(round(absolute % 60))
+
+    if minutes == 60:
+        hours += 1
+        minutes = 0
+
+    return f"{hours:02d}:{minutes:02d}"
+
+
+def maybe_convert_absolute_to_relative(series, start_absolute=540):
+    """
+    Excel time_windows sheet may be absolute clock minutes:
+    09:00 = 540, 18:00 = 1080.
+    Mathematical model uses:
+    09:00 = 0, 18:00 = 540.
+    If values look absolute, subtract 540.
+    """
+    s = pd.to_numeric(series, errors="coerce")
+    non_na = s.dropna()
+
+    if len(non_na) == 0:
+        return s
+
+    # If all values are >= 540, they are probably absolute clock minutes.
+    if non_na.min() >= start_absolute:
+        return s - start_absolute
+
+    return s
+
+
+def make_empty_df(columns):
+    return pd.DataFrame(columns=columns)
+
+
+def parse_week_to_datetime(series):
+    """
+    Robustly converts the week column into real dates.
+    Handles both Excel serial numbers such as 46023 and actual datetime values.
+    """
+    # Case 1: pandas already read it as datetime
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return pd.to_datetime(series, errors="coerce").dt.normalize()
+
+    # Case 2: Excel serial numbers
+    numeric_week = pd.to_numeric(series, errors="coerce")
+    valid_numeric = numeric_week.dropna()
+    if len(valid_numeric) > 0 and valid_numeric.between(30000, 60000).mean() > 0.80:
+        return pd.to_datetime(numeric_week, unit="D", origin="1899-12-30", errors="coerce").dt.normalize()
+
+    # Case 3: strings like 2026-01-05
+    return pd.to_datetime(series, errors="coerce").dt.normalize()
+
+# ============================================================
+# 4. READ EXCEL SHEETS
+# ============================================================
+
+xls = pd.ExcelFile(FILE)
+print("\nExcel sheet names:")
+print(xls.sheet_names)
+
+nodes_sheet_name = "nodes sheet"
+vehicles_sheet_name = "vehicles sheet"
+products_sheet_name = "products sheet"
+days_sheet_name = "days_sheet"
+service_sheet_name = "service_time sheet"
+time_windows_sheet_name = "time_windows sheet"
+vrp_input_sheet_name = "vrp_input_product_based"
+
+df_nodes = safe_read_excel(FILE, sheet_name=nodes_sheet_name)
+df_vehicles = safe_read_excel(FILE, sheet_name=vehicles_sheet_name)
+df_products = safe_read_excel(FILE, sheet_name=products_sheet_name)
+df_days = safe_read_excel(FILE, sheet_name=days_sheet_name)
+df_service = safe_read_excel(FILE, sheet_name=service_sheet_name)
+df_tw = safe_read_excel(FILE, sheet_name=time_windows_sheet_name)
+df_vrp_input = safe_read_excel(FILE, sheet_name=vrp_input_sheet_name)
+
+# Optional product-specific backlog penalty sheet.
+# Expected useful columns after cleaning: product_id, beta
+penalty_sheet_name = "penalty_cost"
+if penalty_sheet_name in xls.sheet_names:
+    df_penalty = safe_read_excel(FILE, sheet_name=penalty_sheet_name)
+else:
+    df_penalty = pd.DataFrame(columns=["product_id", "beta"])
+
+# Optional sheet. The mathematical model derives boxv from shipped volume,
+# so this sheet is read only for checking/reporting unless FORCE_BOX_INFO=True.
+box_info_sheet_name = "box_info sheet"
+if box_info_sheet_name in xls.sheet_names:
+    df_box_info = safe_read_excel(FILE, sheet_name=box_info_sheet_name)
+else:
+    df_box_info = pd.DataFrame(columns=["store_id", "day_id", "box_count"])
+
+# ============================================================
+# 5. CLEAN COLUMNS AND VALUES
+# ============================================================
+
+all_dfs = [df_nodes, df_vehicles, df_products, df_days, df_service, df_tw, df_vrp_input, df_penalty, df_box_info]
+df_nodes, df_vehicles, df_products, df_days, df_service, df_tw, df_vrp_input, df_penalty, df_box_info = [
+    drop_empty_rows(strip_values(clean_columns(df))) for df in all_dfs
+]
+
+# ============================================================
+# 6. STANDARDIZE COLUMN NAMES
+# ============================================================
+
+# Products
+df_products = df_products.rename(columns={
+    "desi": "volume",
+    "hacim": "volume",
+    "vol": "volume",
+    "urun_hacmi": "volume",
+    "ürün_hacmi": "volume",
+    "product_volume": "volume",
+    "item_volume": "volume",
+    "kutu_hacmi": "volume",
+    "hacimsel_ağırlık_(desi)": "volume",
+    "hacimsel_agirlik_(desi)": "volume",
+    "hacimsel_ağırlık_desi": "volume",
+    "hacimsel_agirlik_desi": "volume",
+    "paketlenebilir": "packable",
+    "pack": "packable",
+    "boxable": "packable",
+    "kutuya_girer": "packable",
+    "stok_kodu": "product_id",
+    "sku": "product_id",
+    "ürün_kodu": "product_id",
+    "urun_kodu": "product_id",
+    "backlog_penalty": "beta",
+    "penalty": "beta",
+    "profit_margin": "beta"
+})
+
+for col in list(df_products.columns):
+    if "hacimsel" in col and "desi" in col:
+        df_products = df_products.rename(columns={col: "volume"})
+
+# Nodes
+df_nodes = df_nodes.rename(columns={
+    "node": "node_id",
+    "store_id": "node_id",
+    "location_id": "node_id"
+})
+
+# Vehicles
+df_vehicles = df_vehicles.rename(columns={
+    "vehicle": "vehicle_id",
+    "vehicle_capacity": "capacity",
+    "cap": "capacity",
+    "capvehicle": "capacity",
+    "minload": "min_load",
+    "use_cost": "penalty",
+    "fixed_cost": "penalty",
+    "usecost": "penalty"
+})
+
+# Service time
+df_service = df_service.rename(columns={
+    "node": "node_id",
+    "service_time": "service_time_min",
+    "service_min": "service_time_min",
+    "servicetime": "service_time_min"
+})
+
+# Time windows
+df_tw = df_tw.rename(columns={
+    "node": "node_id",
+    "earliest": "earliest_min",
+    "latest": "latest_min",
+    "twstart": "earliest_min",
+    "twend": "latest_min"
+})
+
+# Demand input
+# The optimized model reads demand directly from vrp_input_product_based.
+# Expected required columns after cleaning:
+# store, product, day_id, week, quantity_ijd
+# req_product_ijd can exist in the sheet, but it is not required by the optimization model.
+
+# Product-specific penalty sheet
+df_penalty = df_penalty.rename(columns={
+    "sku": "product_id",
+    "stok_kodu": "product_id",
+    "ürün_kodu": "product_id",
+    "urun_kodu": "product_id",
+    "backlog_penalty": "beta",
+    "penalty": "beta",
+    "penalty_cost": "beta",
+    "beta_j": "beta"
+})
+
+# Days
+df_days = df_days.rename(columns={
+    "day": "day_id",
+    "date": "day_id"
+})
+
+# Box info
+df_box_info = df_box_info.rename(columns={
+    "store": "store_id",
+    "node": "store_id",
+    "node_id": "store_id",
+    "boxes": "box_count",
+    "box": "box_count"
+})
+
+# ============================================================
+# 7. REQUIRED COLUMN CHECKS
+# ============================================================
+
+check_required_columns(df_nodes, ["node_id"], "nodes sheet")
+check_required_columns(df_vehicles, ["vehicle_id", "capacity", "min_load", "penalty"], "vehicles sheet")
+check_required_columns(df_products, ["product_id", "volume", "packable"], "products sheet")
+check_required_columns(df_days, ["day_id"], "days_sheet")
+check_required_columns(df_service, ["node_id", "service_time_min"], "service_time sheet")
+check_required_columns(df_tw, ["node_id", "earliest_min", "latest_min"], "time_windows sheet")
+check_required_columns(
+    df_vrp_input,
+    ["store", "product", "day_id", "week", "quantity_ijd"],
+    "vrp_input_product_based"
+)
+
+if len(df_penalty) > 0:
+    check_required_columns(df_penalty, ["product_id", "beta"], "penalty_cost")
+
+if len(df_box_info) > 0:
+    check_required_columns(df_box_info, ["store_id", "day_id", "box_count"], "box_info sheet")
+
+print("\nProducts sheet sütunları:")
+print(df_products.columns.tolist())
+
+# ============================================================
+# 8. NUMERIC CONVERSIONS
+# ============================================================
+
+# Clean ids first.
+df_nodes["node_id"] = df_nodes["node_id"].apply(clean_id)
+df_vehicles["vehicle_id"] = df_vehicles["vehicle_id"].apply(clean_id)
+df_products["product_id"] = df_products["product_id"].apply(clean_id)
+df_service["node_id"] = df_service["node_id"].apply(clean_id)
+df_tw["node_id"] = df_tw["node_id"].apply(clean_id)
+df_vrp_input["store"] = df_vrp_input["store"].apply(clean_id)
+df_vrp_input["product"] = df_vrp_input["product"].apply(clean_id)
+if "product_id" in df_penalty.columns:
+    df_penalty["product_id"] = df_penalty["product_id"].apply(clean_id)
+df_box_info["store_id"] = df_box_info["store_id"].apply(clean_id)
+
+# Numeric fields.
+df_vehicles["capacity"] = pd.to_numeric(df_vehicles["capacity"], errors="coerce")
+df_vehicles["min_load"] = pd.to_numeric(df_vehicles["min_load"], errors="coerce")
+df_vehicles["penalty"] = pd.to_numeric(df_vehicles["penalty"], errors="coerce")
+
+df_products["volume"] = pd.to_numeric(df_products["volume"], errors="coerce")
+
+# packable can be 0/1 or yes/no.
+if df_products["packable"].dtype == "object":
+    df_products["packable"] = (
+        df_products["packable"]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .replace({
+            "yes": 1,
+            "y": 1,
+            "true": 1,
+            "packable": 1,
+            "evet": 1,
+            "1": 1,
+            "no": 0,
+            "n": 0,
+            "false": 0,
+            "hayır": 0,
+            "hayir": 0,
+            "0": 0
+        })
+    )
+
+df_products["packable"] = pd.to_numeric(df_products["packable"], errors="coerce").fillna(0).astype(int)
+
+df_service["service_time_min"] = pd.to_numeric(df_service["service_time_min"], errors="coerce").fillna(0)
+
+# Convert time windows to model-relative minutes.
+df_tw["earliest_min_original"] = pd.to_numeric(df_tw["earliest_min"], errors="coerce")
+df_tw["latest_min_original"] = pd.to_numeric(df_tw["latest_min"], errors="coerce")
+df_tw["earliest_min"] = maybe_convert_absolute_to_relative(df_tw["earliest_min"])
+df_tw["latest_min"] = maybe_convert_absolute_to_relative(df_tw["latest_min"])
+
+# vrp_input_product_based numeric fields
+df_vrp_input["day_id"] = pd.to_numeric(df_vrp_input["day_id"], errors="coerce")
+df_vrp_input["quantity_ijd"] = pd.to_numeric(df_vrp_input["quantity_ijd"], errors="coerce").fillna(0)
+
+# req_product_ijd is not needed by this TDVRP model.
+# If it exists in the Excel, keep it numeric only for optional debugging.
+if "req_product_ijd" in df_vrp_input.columns:
+    df_vrp_input["req_product_ijd"] = pd.to_numeric(df_vrp_input["req_product_ijd"], errors="coerce").fillna(0).astype(int)
+
+if len(df_penalty) > 0 and "beta" in df_penalty.columns:
+    df_penalty["beta"] = pd.to_numeric(df_penalty["beta"], errors="coerce")
+
+# Physical shipment quantities should be integer.
+# If your forecast output has decimals, this rounds them for routing.
+ROUND_DEMAND_TO_INTEGER = True
+if ROUND_DEMAND_TO_INTEGER:
+    df_vrp_input["quantity_ijd"] = df_vrp_input["quantity_ijd"].round().astype(int)
+
+# Select the FIRST TWO WEEKS from vrp_input_product_based.
+# Important: because day_id repeats every week, we create an internal sequential model_day.
+# Example: selected weeks 2026-01-01 and 2026-01-05 may become model days 1..7
+# if the first week has only day_id 4 and 5 in the data.
+NUMBER_OF_WEEKS_TO_RUN = 1
+
+# If you want to force exact weeks manually, use e.g.
+# SELECTED_WEEKS = ["2026-01-01", "2026-01-05"]
+# Otherwise leave it as None to take the first two week values in the sheet.
+SELECTED_WEEKS = None
+
+df_vrp_input["week_dt"] = parse_week_to_datetime(df_vrp_input["week"])
+
+unique_weeks = sorted(df_vrp_input["week_dt"].dropna().unique())
+if len(unique_weeks) == 0:
+    raise ValueError("No valid week value found in vrp_input_product_based sheet.")
+
+if SELECTED_WEEKS is None:
+    selected_week_values = unique_weeks[:NUMBER_OF_WEEKS_TO_RUN]
+else:
+    selected_week_values = sorted(pd.to_datetime(SELECTED_WEEKS).normalize().tolist())
+
+if len(selected_week_values) < NUMBER_OF_WEEKS_TO_RUN:
+    print("UYARI: İstenen hafta sayısından daha az hafta bulundu.")
+
+# Keep only the selected first two weeks.
+df_vrp_input = df_vrp_input[df_vrp_input["week_dt"].isin(selected_week_values)].copy()
+
+# Clean/standardize day_id for mapping.
+df_vrp_input["original_day_id"] = pd.to_numeric(df_vrp_input["day_id"], errors="coerce").astype("Int64")
+df_vrp_input = df_vrp_input[df_vrp_input["original_day_id"].notna()].copy()
+df_vrp_input["original_day_id"] = df_vrp_input["original_day_id"].astype(int)
+
+# Build a sequential planning horizon across week-day pairs.
+day_calendar = (
+    df_vrp_input[["week_dt", "original_day_id"]]
+    .drop_duplicates()
+    .sort_values(["week_dt", "original_day_id"])
+    .reset_index(drop=True)
+)
+day_calendar["model_day"] = range(1, len(day_calendar) + 1)
+day_calendar["week_sequence"] = day_calendar["week_dt"].rank(method="dense").astype(int)
+day_calendar["week_label"] = day_calendar["week_dt"].dt.strftime("%Y-%m-%d")
+day_calendar["calendar_label"] = day_calendar["week_label"] + " / day_id " + day_calendar["original_day_id"].astype(str)
+
+df_vrp_input = df_vrp_input.merge(
+    day_calendar[["week_dt", "original_day_id", "model_day"]],
+    on=["week_dt", "original_day_id"],
+    how="left"
+)
+df_vrp_input["model_day"] = df_vrp_input["model_day"].astype(int)
+
+print("Selected weeks for TDVRP:", [pd.Timestamp(x).strftime("%Y-%m-%d") for x in selected_week_values])
+print("Rows after week filter:", len(df_vrp_input))
+print("Internal model-day calendar:")
+print(day_calendar.to_string(index=False))
+
+if len(df_box_info) > 0:
+    df_box_info["day_id"] = pd.to_numeric(df_box_info["day_id"], errors="coerce")
+    df_box_info["box_count"] = pd.to_numeric(df_box_info["box_count"], errors="coerce").fillna(0).round().astype(int)
+
+# Keep only actual vehicles such as V1, V2, ...
+df_vehicles = df_vehicles[df_vehicles["vehicle_id"].notna()].copy()
+df_vehicles["vehicle_id"] = df_vehicles["vehicle_id"].astype(str).str.strip()
+df_vehicles = df_vehicles[df_vehicles["vehicle_id"].str.startswith("V")].copy()
+
+# If min_load is written as 0.30, convert it to 30% of capacity.
+if df_vehicles["min_load"].max() <= 1:
+    df_vehicles["min_load"] = df_vehicles["capacity"] * df_vehicles["min_load"]
+
+# Drop empty product rows.
+df_products = df_products[df_products["product_id"] != ""].copy()
+df_products = df_products[df_products["volume"].notna()].copy()
+
+# Canonical product-id matching.
+# Example in the current test data: vrp_input has mbs20050 while products sheet has MBS20050.
+# This maps demand and penalty rows to the product_id spelling used in products sheet.
+product_canonical = {norm_key(pid): pid for pid in df_products["product_id"].astype(str).tolist()}
+
+df_vrp_input["product_original"] = df_vrp_input["product"]
+df_vrp_input["product"] = df_vrp_input["product"].apply(lambda x: product_canonical.get(norm_key(x), clean_id(x)))
+
+if len(df_penalty) > 0 and "product_id" in df_penalty.columns:
+    df_penalty["product_original"] = df_penalty["product_id"]
+    df_penalty["product_id"] = df_penalty["product_id"].apply(lambda x: product_canonical.get(norm_key(x), clean_id(x)))
+
+# ============================================================
+# 9. SETS
+# ============================================================
+
+nodes = df_nodes["node_id"].astype(str).str.strip().tolist()
+stores = [i for i in nodes if i != DEPOT_NAME]
+
+V = df_vehicles["vehicle_id"].astype(str).str.strip().tolist()
+J = df_products["product_id"].astype(str).str.strip().tolist()
+
+# Validate that vrp_input_product_based uses the same ids as nodes/products.
+input_stores = sorted(set(df_vrp_input["store"].dropna().astype(str)) - {""})
+input_products = sorted(set(df_vrp_input["product"].dropna().astype(str)) - {""})
+missing_input_stores = sorted(set(input_stores) - set(stores))
+missing_input_products = sorted(set(input_products) - set(J))
+
+if missing_input_stores:
+    print("\nHATA: vrp_input_product_based içindeki bazı store değerleri nodes sheet içinde yok:")
+    print(missing_input_stores)
+    raise ValueError("Store id mismatch between vrp_input_product_based and nodes sheet.")
+
+if missing_input_products:
+    print("\nHATA: vrp_input_product_based içindeki bazı product değerleri products sheet içinde yok:")
+    print(missing_input_products)
+    raise ValueError("Product id mismatch between vrp_input_product_based and products sheet.")
+
+# Internal planning days are built from selected week-day pairs.
+# We do NOT use raw day_id directly because day_id repeats in every week.
+RUN_ALL_DAYS = True
+D = sorted(day_calendar["model_day"].astype(int).tolist())
+D_all = D.copy()
+NUMBER_OF_WORKING_DAYS_IN_TEST = len(D)
+
+# Useful dictionary for reports.
+day_meta = {
+    int(row["model_day"]): {
+        "week_sequence": int(row["week_sequence"]),
+        "week_label": row["week_label"],
+        "original_day_id": int(row["original_day_id"]),
+        "calendar_label": row["calendar_label"]
+    }
+    for _, row in day_calendar.iterrows()
+}
+
+# Time periods in the mathematical model:
+# p = 1: 09.00-11.00 -> 0-120
+# p = 2: 11.00-13.00 -> 120-240
+# p = 3: 13.00-15.00 -> 240-360
+# p = 4: 15.00-17.00 -> 360-480
+# p = 5: 17.00-18.00 -> 480-540
+P = [1, 2, 3, 4, 5]
+
+print("\n========== SET SUMMARY ==========")
+print("Depot:", DEPOT_NAME)
+print("Number of nodes:", len(nodes))
+print("Number of stores:", len(stores))
+print("Vehicles:", V)
+print("Number of products:", len(J))
+print("Days used in model:", D)
+print("Time periods P:", P)
+
+# ============================================================
+# 9A. INPUT CONSISTENCY CHECKS
+# ============================================================
+
+input_stores = sorted(df_vrp_input["store"].dropna().astype(str).str.strip().unique().tolist())
+input_products = sorted(df_vrp_input["product"].dropna().astype(str).str.strip().unique().tolist())
+
+missing_stores_in_nodes = sorted(set(input_stores) - set(stores))
+missing_products_in_products = sorted(set(input_products) - set(J))
+
+if missing_stores_in_nodes:
+    print("\nHATA: vrp_input_product_based içinde nodes sheet'te olmayan store var:")
+    print(missing_stores_in_nodes)
+    raise ValueError("Store ids must match nodes sheet exactly.")
+
+if missing_products_in_products:
+    print("\nHATA: vrp_input_product_based içinde products sheet'te olmayan product var:")
+    print(missing_products_in_products[:50])
+    raise ValueError("Product ids must match products sheet exactly.")
+
+# Check travel time matrices have all nodes as row and column labels.
+# The actual matrix reading below also fills missing arcs with 99999, but this warning helps catch typos early.
+for check_sheet in ["travel_time_9 sheet", "travel_time_11 sheet", "travel_time_13 sheet", "travel_time_15 sheet", "travel_time_17 sheet"]:
+    if check_sheet in xls.sheet_names:
+        df_check = pd.read_excel(FILE, sheet_name=check_sheet, index_col=0)
+        row_nodes = set(clean_id(x) for x in df_check.index.tolist())
+        col_nodes = set(clean_id(x) for x in df_check.columns.tolist())
+        missing_rows = sorted(set(nodes) - row_nodes)
+        missing_cols = sorted(set(nodes) - col_nodes)
+        if missing_rows or missing_cols:
+            print(f"\nUYARI: {check_sheet} içinde eksik node var.")
+            print("Eksik satırlar:", missing_rows)
+            print("Eksik sütunlar:", missing_cols)
+            print("Eksik travel time'lar 99999 olarak atanabilir; sonucu bozabilir.")
+
+# ============================================================
+# 10. PARAMETERS
+# ============================================================
+
+CapVehicle = dict(zip(df_vehicles["vehicle_id"], df_vehicles["capacity"]))
+minload = dict(zip(df_vehicles["vehicle_id"], df_vehicles["min_load"]))
+
+# ------------------------------------------------------------
+# VEHICLE USE COST USED INSIDE THE OBJECTIVE
+# ------------------------------------------------------------
+# Important: 2250 TL and 4650 TL are monthly fixed costs.
+# We do NOT put these monthly values directly into the objective.
+# We first convert them into a daily cost and then into a
+# minute-equivalent cost because the main objective is time-based.
+#
+# Formula:
+# daily_fixed_cost = monthly_fixed_cost / working_days_per_month
+# minute_equivalent = daily_fixed_cost / driver_cost_per_min
+#
+# Final objective use costs for this run:
+# V1 small = 122.73 minute-equivalent
+# V2 large = 253.64 minute-equivalent
+# ------------------------------------------------------------
+MONTHLY_FIXED_COST_SMALL_TL = 2250
+MONTHLY_FIXED_COST_LARGE_TL = 4650
+WORKING_DAYS_PER_MONTH = 22
+DRIVER_HOURLY_COST_TL = 150
+DRIVER_COST_PER_MIN_TL = DRIVER_HOURLY_COST_TL / 60
+
+# Final vehicle use cost values used inside the objective.
+# These are minute-equivalent penalty values selected for the final comparison run.
+# They are NOT raw monthly fixed costs.
+USE_COST_SMALL = MONTHLY_FIXED_COST_SMALL_TL / WORKING_DAYS_PER_MONTH
+USE_COST_LARGE = MONTHLY_FIXED_COST_LARGE_TL / WORKING_DAYS_PER_MONTH
+
+def get_vehicle_type(v):
+    """Returns small/large from vehicle_type column when available."""
+    if "vehicle_type" in df_vehicles.columns:
+        row = df_vehicles[df_vehicles["vehicle_id"] == v]
+        if len(row) > 0:
+            vt = str(row.iloc[0]["vehicle_type"]).strip().lower()
+            if "small" in vt or "küçük" in vt or "kucuk" in vt:
+                return "small"
+            if "large" in vt or "büyük" in vt or "buyuk" in vt:
+                return "large"
+
+    # Fallback for the current TESTDATASI07.xlsx structure.
+    if v in ["V1"]:
+        return "small"
+    return "large"
+
+UseCost = {}
+for v in V:
+    if get_vehicle_type(v) == "small":
+        UseCost[v] = USE_COST_SMALL
+    else:
+        UseCost[v] = USE_COST_LARGE
+
+vol = dict(zip(df_products["product_id"], df_products["volume"]))
+pack = dict(zip(df_products["product_id"], df_products["packable"]))
+
+# Backlog penalty beta_j.
+# Product-specific beta is read from the penalty_cost sheet when available.
+# If any product has no beta value, DEFAULT_BACKLOG_PENALTY is used only for that product.
+DEFAULT_BACKLOG_PENALTY = 50
+BETA_SOURCE = "default_50"
+
+if len(df_penalty) > 0 and "product_id" in df_penalty.columns and "beta" in df_penalty.columns:
+    penalty_map = {}
+    for _, row in df_penalty.iterrows():
+        pid = clean_id(row.get("product_id", ""))
+        if pid == "" or pid not in J:
+            continue
+        val = row.get("beta", None)
+        if pd.notna(val):
+            penalty_map[pid] = float(val)
+
+    if len(penalty_map) > 0:
+        beta = {j: penalty_map.get(j, DEFAULT_BACKLOG_PENALTY) for j in J}
+        BETA_SOURCE = "penalty_cost sheet"
+    else:
+        beta = {j: DEFAULT_BACKLOG_PENALTY for j in J}
+else:
+    beta = {j: DEFAULT_BACKLOG_PENALTY for j in J}
+
+df_beta_table = pd.DataFrame([
+    {
+        "product_id": j,
+        "beta": beta[j],
+        "beta_source": BETA_SOURCE if j in set(df_penalty.get("product_id", pd.Series(dtype=str)).astype(str).tolist()) else "default/fallback",
+        "has_penalty_in_sheet": int(j in set(df_penalty.get("product_id", pd.Series(dtype=str)).astype(str).tolist()))
+    }
+    for j in J
+])
+
+ServiceTime = dict(zip(df_service["node_id"], df_service["service_time_min"]))
+TWstart = dict(zip(df_tw["node_id"], df_tw["earliest_min"]))
+TWend = dict(zip(df_tw["node_id"], df_tw["latest_min"]))
+
+# Defaults for missing nodes.
+for i in nodes:
+    ServiceTime.setdefault(i, 0)
+
+# Model time system.
+StartOfDay = 0
+LunchStart = 180
+EndOfDay = 540
+BreakTime = 60
+
+TWstart.setdefault(DEPOT_NAME, StartOfDay)
+TWend.setdefault(DEPOT_NAME, EndOfDay)
+
+# quantity[i,j,d] directly from vrp_input_product_based.
+# Duplicate store-product-day rows are summed.
+quantity = {}
+for _, row in df_vrp_input.iterrows():
+    if row["store"] != "" and row["product"] != "" and not pd.isna(row["day_id"]):
+        key = (row["store"], row["product"], int(row["model_day"]))
+        quantity[key] = quantity.get(key, 0) + float(row["quantity_ijd"])
+
+for i in stores:
+    for j in J:
+        for d in D:
+            quantity.setdefault((i, j, d), 0)
+
+# req[i,d] directly calculated from quantity_ijd.
+# Store-day req = 1 if the selected week has positive total demand for that store-day.
+# This means Excel does NOT need a separate visit_required column.
+df_req_temp = (
+    df_vrp_input
+    .groupby(["store", "model_day"], as_index=False)
+    .agg(total_quantity=("quantity_ijd", "sum"))
+)
+
+df_req_temp["visit_required_final"] = (df_req_temp["total_quantity"] > 0).astype(int)
+
+req = {}
+for _, row in df_req_temp.iterrows():
+    if row["store"] != "" and not pd.isna(row["model_day"]):
+        req[(row["store"], int(row["model_day"]))] = int(row["visit_required_final"])
+
+# Default req if missing: 1 when demand exists, otherwise 0.
+for i in stores:
+    for d in D:
+        if (i, d) not in req:
+            total_demand = sum(quantity[i, j, d] for j in J)
+            req[(i, d)] = 1 if total_demand > 0 else 0
+
+# Optional box info for output check.
+box_info = {}
+if len(df_box_info) > 0:
+    for _, row in df_box_info.iterrows():
+        if row["store_id"] != "" and not pd.isna(row["day_id"]):
+            box_info[(row["store_id"], int(row["day_id"]))] = int(row["box_count"])
+
+# Model constants.
+Capbox = 32
+lambda_ = DRIVER_COST_PER_MIN_TL
+EPS = 0.01
+
+# Constraint-specific Big-M values
+# Time system: 09:00 = 0, 18:00 = 540. Therefore, 720 minutes is a safe
+# but much tighter value than a generic 100000 for time-related constraints.
+Mtime = 720
+Mreturn = 720
+
+# Shipment Big-M: maximum possible total shipment quantity in the selected horizon.
+total_quantity = sum(quantity[i, j, d] for i in stores for j in J for d in D)
+Mship = max(1, total_quantity) + 1
+
+# Box Big-M values:
+# MboxCount is used where the variable is a number of boxes.
+# MboxVolume is used where the expression is in volume/desi units.
+total_packable_volume = sum(
+    pack[j] * vol[j] * quantity[i, j, d]
+    for i in stores
+    for j in J
+    for d in D
+)
+MboxCount = max(1, math.ceil(total_packable_volume / Capbox) + 1)
+MboxVolume = Capbox * MboxCount
+
+Startp = {
+    1: 0,
+    2: 120,
+    3: 240,
+    4: 360,
+    5: 480
+}
+
+Endp = {
+    1: 120,
+    2: 240,
+    3: 360,
+    4: 480,
+    5: 540
+}
+
+print("\n========== PARAMETER SUMMARY ==========")
+print("StartOfDay:", StartOfDay, "=", relative_min_to_clock(StartOfDay))
+print("LunchStart:", LunchStart, "=", relative_min_to_clock(LunchStart))
+print("EndOfDay:", EndOfDay, "=", relative_min_to_clock(EndOfDay))
+print("Capbox:", Capbox)
+print("lambda_:", lambda_)
+print("Beta source:", BETA_SOURCE)
+print("Beta min/max:", min(beta.values()), max(beta.values()))
+print("Default beta fallback:", DEFAULT_BACKLOG_PENALTY)
+print("UseCost minute-equivalent:", UseCost)
+print("Monthly fixed costs are converted; raw monthly fixed costs are not directly used in objective.")
+print("Mtime:", Mtime)
+print("Mreturn:", Mreturn)
+print("Mship:", Mship)
+print("MboxCount:", MboxCount)
+print("MboxVolume:", MboxVolume)
+
+# ============================================================
+# 11. TRAVEL TIME PARAMETER
+# time[i,k,p]
+# ============================================================
+
+time = {}
+
+# We use 5 periods from the mathematical model.
+# travel_time_18 sheet exists in the Excel, but the model period table ends at 18:00,
+# so the last active period is p=5, 17:00-18:00.
+sheet_map = {
+    1: "travel_time_9 sheet",
+    2: "travel_time_11 sheet",
+    3: "travel_time_13 sheet",
+    4: "travel_time_15 sheet",
+    5: "travel_time_17 sheet"
+}
+
+for p, sheet in sheet_map.items():
+    df_tt = safe_read_excel(FILE, sheet_name=sheet, index_col=0)
+    df_tt.index = df_tt.index.map(clean_id)
+    df_tt.columns = [clean_id(c) for c in df_tt.columns]
+
+    for i in nodes:
+        for k in nodes:
+            if i == k:
+                time[(i, k, p)] = 0
+            elif i in df_tt.index and k in df_tt.columns:
+                val = df_tt.loc[i, k]
+                if pd.isna(val):
+                    val = 99999
+                time[(i, k, p)] = float(val)
+            else:
+                time[(i, k, p)] = 99999
+
+# ============================================================
+# 12. CREATE MODEL
+# ============================================================
+
+if gurobi_env is not None:
+    m = gp.Model("TDVRP_final_model_with_backlog_lunch_return", env=gurobi_env)
+else:
+    m = gp.Model("TDVRP_final_model_with_backlog_lunch_return")
+
+# ============================================================
+# 13. DECISION VARIABLES
+# ============================================================
+
+z = m.addVars(nodes, nodes, V, D, vtype=GRB.BINARY, name="z")
+u = m.addVars(V, D, vtype=GRB.BINARY, name="u")
+y = m.addVars(stores, V, D, vtype=GRB.BINARY, name="y")
+
+T = m.addVars(nodes, V, D, vtype=GRB.CONTINUOUS, lb=0, name="T")
+Dep = m.addVars(nodes, V, D, vtype=GRB.CONTINUOUS, lb=0, name="Dep")
+
+w = m.addVars(nodes, nodes, V, D, P, vtype=GRB.BINARY, name="w")
+
+ship = m.addVars(stores, J, V, D, vtype=GRB.INTEGER, lb=0, name="ship")
+Back = m.addVars(stores, J, D, vtype=GRB.INTEGER, lb=0, name="Back")
+boxv = m.addVars(stores, V, D, vtype=GRB.INTEGER, lb=0, name="box")
+
+r = m.addVars(stores, V, D, vtype=GRB.BINARY, name="r")
+
+N_store = len(stores)
+ordv = m.addVars(stores, V, D, vtype=GRB.INTEGER, lb=0, ub=N_store, name="ord")
+
+After12 = m.addVars(stores, V, D, vtype=GRB.BINARY, name="After12")
+LunchNeed = m.addVars(V, D, vtype=GRB.BINARY, name="LunchNeed")
+ReturnTime = m.addVars(V, D, vtype=GRB.CONTINUOUS, lb=0, name="ReturnTime")
+
+# ============================================================
+# 14. OBJECTIVE FUNCTION
+# min Z =
+# lambda * sum(time_ikp * w_ikvdp)
+# + sum(UseCost_v * u_vd)
+# + sum(beta_j * Back_ijd)
+# ============================================================
+
+m.setObjective(
+    lambda_ * gp.quicksum(
+        time[i, k, p] * w[i, k, v, d, p]
+        for d in D
+        for v in V
+        for i in nodes
+        for k in nodes
+        if i != k
+        for p in P
+    )
+    +
+    gp.quicksum(
+        UseCost[v] * u[v, d]
+        for d in D
+        for v in V
+    )
+    +
+    gp.quicksum(
+        beta[j] * Back[i, j, d]
+        for d in D
+        for i in stores
+        for j in J
+    ),
+    GRB.MINIMIZE
+)
+
+# ============================================================
+# 15. CONSTRAINTS
+# ============================================================
+
+# ------------------------------------------------------------
+# 1) No Self Loop Constraint
+# z_iivd = 0
+# w_iivdp = 0
+# ------------------------------------------------------------
+for i in nodes:
+    for v in V:
+        for d in D:
+            m.addConstr(z[i, i, v, d] == 0, name=f"no_self_loop_z_{i}_{v}_{d}")
+            for p in P:
+                m.addConstr(w[i, i, v, d, p] == 0, name=f"no_self_loop_w_{i}_{v}_{d}_{p}")
+
+# ------------------------------------------------------------
+# 2) Depot Departure Constraint
+# sum_k z_0kvd = u_vd
+# ------------------------------------------------------------
+for v in V:
+    for d in D:
+        m.addConstr(
+            gp.quicksum(z[DEPOT_NAME, k, v, d] for k in stores) == u[v, d],
+            name=f"depot_departure_{v}_{d}"
+        )
+
+# ------------------------------------------------------------
+# 3) Depot Return Constraint
+# sum_i z_i0vd = u_vd
+# ------------------------------------------------------------
+for v in V:
+    for d in D:
+        m.addConstr(
+            gp.quicksum(z[i, DEPOT_NAME, v, d] for i in stores) == u[v, d],
+            name=f"depot_return_{v}_{d}"
+        )
+
+# ------------------------------------------------------------
+# 4) Flow Conservation Constraint
+# outgoing = incoming for each visited store
+# ------------------------------------------------------------
+for i in stores:
+    for v in V:
+        for d in D:
+            m.addConstr(
+                gp.quicksum(z[i, k, v, d] for k in nodes if k != i)
+                ==
+                gp.quicksum(z[k, i, v, d] for k in nodes if k != i),
+                name=f"flow_conservation_{i}_{v}_{d}"
+            )
+
+# ------------------------------------------------------------
+# 5) Store Assignment Constraint
+# sum_v y_ivd <= req_id
+# Store visit is not forced because backlog is allowed.
+# ------------------------------------------------------------
+for i in stores:
+    for d in D:
+        m.addConstr(
+            gp.quicksum(y[i, v, d] for v in V) <= req[(i, d)],
+            name=f"store_assignment_{i}_{d}"
+        )
+
+# ------------------------------------------------------------
+# 6) Route-Assignment Linking Constraints
+# sum_k z_ikvd = y_ivd
+# sum_k z_kivd = y_ivd
+# ------------------------------------------------------------
+for i in stores:
+    for v in V:
+        for d in D:
+            m.addConstr(
+                gp.quicksum(z[i, k, v, d] for k in nodes if k != i) == y[i, v, d],
+                name=f"route_assignment_out_{i}_{v}_{d}"
+            )
+            m.addConstr(
+                gp.quicksum(z[k, i, v, d] for k in nodes if k != i) == y[i, v, d],
+                name=f"route_assignment_in_{i}_{v}_{d}"
+            )
+
+# ------------------------------------------------------------
+# 7) Vehicle Usage Consistency Constraint
+# y_ivd <= u_vd
+# ------------------------------------------------------------
+for i in stores:
+    for v in V:
+        for d in D:
+            m.addConstr(
+                y[i, v, d] <= u[v, d],
+                name=f"vehicle_usage_consistency_{i}_{v}_{d}"
+            )
+
+# ------------------------------------------------------------
+# 8) Shipment-Vehicle Assignment Linking Constraint
+# ship_ijvd <= Mship * y_ivd
+# ------------------------------------------------------------
+for i in stores:
+    for j in J:
+        for v in V:
+            for d in D:
+                m.addConstr(
+                    ship[i, j, v, d] <= Mship * y[i, v, d],
+                    name=f"shipment_visit_link_{i}_{j}_{v}_{d}"
+                )
+
+# ------------------------------------------------------------
+# 9) Box-Vehicle Assignment Linking Constraint
+# box_ivd <= Mbox * y_ivd
+# ------------------------------------------------------------
+for i in stores:
+    for v in V:
+        for d in D:
+            m.addConstr(
+                boxv[i, v, d] <= MboxCount * y[i, v, d],
+                name=f"box_visit_link_{i}_{v}_{d}"
+            )
+
+# ------------------------------------------------------------
+# 10) No Empty Visit Constraint
+# sum_j ship_ijvd >= y_ivd
+# ------------------------------------------------------------
+for i in stores:
+    for v in V:
+        for d in D:
+            m.addConstr(
+                gp.quicksum(ship[i, j, v, d] for j in J) >= y[i, v, d],
+                name=f"no_empty_visit_{i}_{v}_{d}"
+            )
+
+# ------------------------------------------------------------
+# 11) Backlog Balance Constraint
+# sum_v ship_ijvd + Back_ijd = quantity_ijd + Back_ij,d-1
+# Back_ij,0 = 0 is handled by previous_backlog = 0 for first modeled day.
+# ------------------------------------------------------------
+D_sorted = sorted(D)
+
+for i in stores:
+    for j in J:
+        for idx, d in enumerate(D_sorted):
+            if idx == 0:
+                previous_backlog = 0
+            else:
+                previous_day = D_sorted[idx - 1]
+                previous_backlog = Back[i, j, previous_day]
+
+            m.addConstr(
+                gp.quicksum(ship[i, j, v, d] for v in V) + Back[i, j, d]
+                ==
+                quantity[i, j, d] + previous_backlog,
+                name=f"backlog_balance_{i}_{j}_{d}"
+            )
+
+# ------------------------------------------------------------
+# 12) Box Requirement Constraint
+# Capbox * box_ivd >= sum_j pack_j * vol_j * ship_ijvd
+# ------------------------------------------------------------
+for i in stores:
+    for v in V:
+        for d in D:
+            m.addConstr(
+                Capbox * boxv[i, v, d]
+                >=
+                gp.quicksum(pack[j] * vol[j] * ship[i, j, v, d] for j in J),
+                name=f"box_requirement_{i}_{v}_{d}"
+            )
+
+# ------------------------------------------------------------
+# 13) Box Tightening Constraint
+# Capbox * (box_ivd - 1) <= packable volume + MboxVolume(1-y_ivd)
+# This prevents unnecessarily large box counts.
+# ------------------------------------------------------------
+for i in stores:
+    for v in V:
+        for d in D:
+            m.addConstr(
+                Capbox * (boxv[i, v, d] - 1)
+                <=
+                gp.quicksum(pack[j] * vol[j] * ship[i, j, v, d] for j in J)
+                + MboxVolume * (1 - y[i, v, d]),
+                name=f"box_tightening_{i}_{v}_{d}"
+            )
+
+# ------------------------------------------------------------
+# 14) Vehicle Capacity Constraint
+# sum_i Capbox*box_ivd + nonpackable volume <= CapVehicle_v * u_vd
+# ------------------------------------------------------------
+for v in V:
+    for d in D:
+        m.addConstr(
+            gp.quicksum(Capbox * boxv[i, v, d] for i in stores)
+            +
+            gp.quicksum(
+                (1 - pack[j]) * vol[j] * ship[i, j, v, d]
+                for i in stores
+                for j in J
+            )
+            <= CapVehicle[v] * u[v, d],
+            name=f"vehicle_capacity_{v}_{d}"
+        )
+
+# ------------------------------------------------------------
+# 15) Minimum Load Constraint
+# load >= minload_v * u_vd
+# ------------------------------------------------------------
+for v in V:
+    for d in D:
+        m.addConstr(
+            gp.quicksum(Capbox * boxv[i, v, d] for i in stores)
+            +
+            gp.quicksum(
+                (1 - pack[j]) * vol[j] * ship[i, j, v, d]
+                for i in stores
+                for j in J
+            )
+            >= minload[v] * u[v, d],
+            name=f"minimum_load_{v}_{d}"
+        )
+
+# ------------------------------------------------------------
+# 16) Initial Depot Time Constraint
+# Dep_0vd = StartOfDay
+# T_0vd = StartOfDay is also fixed for clean output.
+# ------------------------------------------------------------
+for v in V:
+    for d in D:
+        m.addConstr(T[DEPOT_NAME, v, d] == StartOfDay, name=f"initial_depot_arrival_time_{v}_{d}")
+        m.addConstr(Dep[DEPOT_NAME, v, d] == StartOfDay, name=f"initial_depot_departure_time_{v}_{d}")
+
+# ------------------------------------------------------------
+# 17) Departure Time Definition Constraint
+# Dep_ivd = T_ivd + ServiceTime_i + BreakTime*r_ivd if y_ivd = 1
+# ------------------------------------------------------------
+for i in stores:
+    for v in V:
+        for d in D:
+            m.addConstr(
+                Dep[i, v, d]
+                >=
+                T[i, v, d] + ServiceTime[i] + BreakTime * r[i, v, d]
+                - Mtime * (1 - y[i, v, d]),
+                name=f"departure_time_lb_{i}_{v}_{d}"
+            )
+            m.addConstr(
+                Dep[i, v, d]
+                <=
+                T[i, v, d] + ServiceTime[i] + BreakTime * r[i, v, d]
+                + Mtime * (1 - y[i, v, d]),
+                name=f"departure_time_ub_{i}_{v}_{d}"
+            )
+
+# ------------------------------------------------------------
+# 18) Lunch Only If Store Is Visited Constraint
+# r_ivd <= y_ivd
+# ------------------------------------------------------------
+for i in stores:
+    for v in V:
+        for d in D:
+            m.addConstr(
+                r[i, v, d] <= y[i, v, d],
+                name=f"lunch_only_if_visited_{i}_{v}_{d}"
+            )
+
+# ------------------------------------------------------------
+# 19) After 12 Classification Constraint
+# After12_ivd = 1 if visited store is reached at/after 12:00
+# ------------------------------------------------------------
+for i in stores:
+    for v in V:
+        for d in D:
+            m.addConstr(
+                After12[i, v, d] <= y[i, v, d],
+                name=f"after12_only_if_visited_{i}_{v}_{d}"
+            )
+
+            # If After12 = 1, T >= LunchStart.
+            m.addConstr(
+                T[i, v, d]
+                >=
+                LunchStart - Mtime * (1 - After12[i, v, d]),
+                name=f"after12_arrival_lb_{i}_{v}_{d}"
+            )
+
+            # If y = 1 and After12 = 0, T <= LunchStart - EPS.
+            m.addConstr(
+                T[i, v, d]
+                <=
+                LunchStart - EPS
+                + Mtime * After12[i, v, d]
+                + Mtime * (1 - y[i, v, d]),
+                name=f"before12_arrival_ub_{i}_{v}_{d}"
+            )
+
+# ------------------------------------------------------------
+# 20) Lunch Need Definition Constraint
+# LunchNeed_vd = 1 if at least one visited store is reached after 12:00
+# ------------------------------------------------------------
+for v in V:
+    for d in D:
+        for i in stores:
+            m.addConstr(
+                LunchNeed[v, d] >= After12[i, v, d],
+                name=f"lunchneed_lb_{i}_{v}_{d}"
+            )
+
+        m.addConstr(
+            LunchNeed[v, d]
+            <=
+            gp.quicksum(After12[i, v, d] for i in stores),
+            name=f"lunchneed_ub_{v}_{d}"
+        )
+
+# ------------------------------------------------------------
+# 21) Lunch Count Constraint
+# sum_i r_ivd = LunchNeed_vd
+# ------------------------------------------------------------
+for v in V:
+    for d in D:
+        m.addConstr(
+            gp.quicksum(r[i, v, d] for i in stores) == LunchNeed[v, d],
+            name=f"lunch_count_{v}_{d}"
+        )
+
+# ------------------------------------------------------------
+# 22) Lunch Only After 12 Constraint
+# r_ivd <= After12_ivd
+# ------------------------------------------------------------
+for i in stores:
+    for v in V:
+        for d in D:
+            m.addConstr(
+                r[i, v, d] <= After12[i, v, d],
+                name=f"lunch_only_after12_{i}_{v}_{d}"
+            )
+
+# ------------------------------------------------------------
+# 23) Lunch at First After 12 Store Constraint
+# If r_i = 1, then i must be the first store among After12 stores.
+# ord_i <= ord_k + |S|(1-r_i) + |S|(1-After12_k)
+# ------------------------------------------------------------
+for i in stores:
+    for k in stores:
+        if i != k:
+            for v in V:
+                for d in D:
+                    m.addConstr(
+                        ordv[i, v, d]
+                        <=
+                        ordv[k, v, d]
+                        + N_store * (1 - r[i, v, d])
+                        + N_store * (1 - After12[k, v, d]),
+                        name=f"lunch_first_after12_{i}_{k}_{v}_{d}"
+                    )
+
+# ------------------------------------------------------------
+# 24) Store Departure Before End of Day Constraint
+# Dep_ivd <= EndOfDay if visited
+# ------------------------------------------------------------
+for i in stores:
+    for v in V:
+        for d in D:
+            m.addConstr(
+                Dep[i, v, d] <= EndOfDay + Mtime * (1 - y[i, v, d]),
+                name=f"store_departure_before_end_{i}_{v}_{d}"
+            )
+
+# ------------------------------------------------------------
+# 25) Time Propagation Constraint
+# T_kvd >= Dep_ivd + sum_p time_ikp*w_ikvdp - M(1-z_ikvd)
+# for k in stores. Depot return is handled separately by ReturnTime.
+# ------------------------------------------------------------
+for i in nodes:
+    for k in stores:
+        if i != k:
+            for v in V:
+                for d in D:
+                    m.addConstr(
+                        T[k, v, d]
+                        >=
+                        Dep[i, v, d]
+                        +
+                        gp.quicksum(time[i, k, p] * w[i, k, v, d, p] for p in P)
+                        - Mtime * (1 - z[i, k, v, d]),
+                        name=f"time_propagation_{i}_{k}_{v}_{d}"
+                    )
+
+# ------------------------------------------------------------
+# 26) Depot Return Time Calculation Constraint
+# ReturnTime_vd = Dep_ivd + travel time from last store i to depot
+# ------------------------------------------------------------
+for i in stores:
+    for v in V:
+        for d in D:
+            m.addConstr(
+                ReturnTime[v, d]
+                >=
+                Dep[i, v, d]
+                +
+                gp.quicksum(time[i, DEPOT_NAME, p] * w[i, DEPOT_NAME, v, d, p] for p in P)
+                - Mreturn * (1 - z[i, DEPOT_NAME, v, d]),
+                name=f"return_time_lb_{i}_{v}_{d}"
+            )
+            m.addConstr(
+                ReturnTime[v, d]
+                <=
+                Dep[i, v, d]
+                +
+                gp.quicksum(time[i, DEPOT_NAME, p] * w[i, DEPOT_NAME, v, d, p] for p in P)
+                + Mreturn * (1 - z[i, DEPOT_NAME, v, d]),
+                name=f"return_time_ub_{i}_{v}_{d}"
+            )
+
+for v in V:
+    for d in D:
+        m.addConstr(
+            ReturnTime[v, d] <= Mreturn * u[v, d],
+            name=f"return_time_only_if_used_{v}_{d}"
+        )
+
+# ------------------------------------------------------------
+# 27) Time Window Constraint for Arrival
+# T_ivd >= TWstart_i if visited
+# ------------------------------------------------------------
+for i in stores:
+    for v in V:
+        for d in D:
+            m.addConstr(
+                T[i, v, d] >= TWstart[i] - Mtime * (1 - y[i, v, d]),
+                name=f"time_window_start_{i}_{v}_{d}"
+            )
+
+# ------------------------------------------------------------
+# 28) Departure Before Time Window End Constraint
+# Dep_ivd <= TWend_i if visited
+# ------------------------------------------------------------
+for i in stores:
+    for v in V:
+        for d in D:
+            m.addConstr(
+                Dep[i, v, d] <= TWend[i] + Mtime * (1 - y[i, v, d]),
+                name=f"time_window_end_{i}_{v}_{d}"
+            )
+
+# ------------------------------------------------------------
+# 29) Time Slot Selection Constraint
+# sum_p w_ikvdp = z_ikvd
+# ------------------------------------------------------------
+for i in nodes:
+    for k in nodes:
+        if i != k:
+            for v in V:
+                for d in D:
+                    m.addConstr(
+                        gp.quicksum(w[i, k, v, d, p] for p in P) == z[i, k, v, d],
+                        name=f"time_slot_selection_{i}_{k}_{v}_{d}"
+                    )
+
+# ------------------------------------------------------------
+# 30) Time Period Activation Constraints
+# If w_ikvdp = 1, then Dep_i is inside period p.
+# ------------------------------------------------------------
+for i in nodes:
+    for k in nodes:
+        if i != k:
+            for v in V:
+                for d in D:
+                    for p in P:
+                        m.addConstr(
+                            Dep[i, v, d] >= Startp[p] - Mtime * (1 - w[i, k, v, d, p]),
+                            name=f"time_period_lb_{i}_{k}_{v}_{d}_{p}"
+                        )
+                        m.addConstr(
+                            Dep[i, v, d] <= Endp[p] + Mtime * (1 - w[i, k, v, d, p]),
+                            name=f"time_period_ub_{i}_{k}_{v}_{d}_{p}"
+                        )
+
+# ------------------------------------------------------------
+# 31) MTZ Route Order Bounds
+# ord_ivd <= |S| y_ivd
+# ord_ivd >= y_ivd
+# ------------------------------------------------------------
+for i in stores:
+    for v in V:
+        for d in D:
+            m.addConstr(
+                ordv[i, v, d] <= N_store * y[i, v, d],
+                name=f"mtz_order_upper_{i}_{v}_{d}"
+            )
+            m.addConstr(
+                ordv[i, v, d] >= y[i, v, d],
+                name=f"mtz_order_lower_{i}_{v}_{d}"
+            )
+
+# ------------------------------------------------------------
+# 32) MTZ Subtour Elimination Constraint
+# ord_i - ord_k + |S| z_ik <= |S|-1
+# ------------------------------------------------------------
+for i in stores:
+    for k in stores:
+        if i != k:
+            for v in V:
+                for d in D:
+                    m.addConstr(
+                        ordv[i, v, d] - ordv[k, v, d] + N_store * z[i, k, v, d]
+                        <=
+                        N_store - 1,
+                        name=f"mtz_subtour_{i}_{k}_{v}_{d}"
+                    )
+
+# ============================================================
+# 16. OPTIONAL: FORCE BOX_INFO SHEET
+# ============================================================
+# The mathematical model normally lets boxv be decided from shipped packable volume.
+# If your instructor wants box_info sheet to be fixed as input, set FORCE_BOX_INFO=True.
+# Then the model forces total boxes delivered to store i on day d to equal box_info[i,d].
+# Default False because boxv is a decision variable in the model text.
+
+FORCE_BOX_INFO = False
+
+if FORCE_BOX_INFO and len(box_info) > 0:
+    for i in stores:
+        for d in D:
+            if (i, d) in box_info:
+                m.addConstr(
+                    gp.quicksum(boxv[i, v, d] for v in V) == box_info[(i, d)],
+                    name=f"force_box_info_{i}_{d}"
+                )
+
+# ============================================================
+# 17. SOLVER SETTINGS AND OPTIMIZATION
+# ============================================================
+
+# No time limit for this run.
+# If you later want to stop after a fixed time, set USE_TIME_LIMIT=True.
+USE_TIME_LIMIT = True
+TIME_LIMIT_SEC = 25200
+MIP_GAP = None
+
+if USE_TIME_LIMIT and TIME_LIMIT_SEC is not None:
+    m.setParam("TimeLimit", TIME_LIMIT_SEC)
+
+# No MIPGap is forced in this run. If MIP_GAP is not None, Gurobi can stop at that gap.
+if MIP_GAP is not None:
+    m.setParam("MIPGap", MIP_GAP)
+
+m.setParam("MIPFocus", 1)
+m.setParam("OutputFlag", 1)
+
+m.optimize()
+
+# ============================================================
+# 18. ROUTE EXTRACTION FUNCTION
+# ============================================================
+
+def get_selected_period(i, k, v, d):
+    chosen = [p for p in P if w[i, k, v, d, p].X > 0.5]
+    return chosen[0] if chosen else None
+
+
+def build_route_for_vehicle(v, d):
+    route = []
+    current = DEPOT_NAME
+    visited_arcs = set()
+    sequence = 0
+
+    while True:
+        next_nodes = [
+            k for k in nodes
+            if k != current
+            and z[current, k, v, d].X > 0.5
+            and (current, k) not in visited_arcs
+        ]
+
+        if len(next_nodes) == 0:
+            break
+
+        next_node = next_nodes[0]
+        visited_arcs.add((current, next_node))
+
+        selected_p = get_selected_period(current, next_node, v, d)
+        travel_time_min = time[(current, next_node, selected_p)] if selected_p is not None else None
+
+        row = {
+            "day": d,
+            "vehicle": v,
+            "sequence": sequence,
+            "from_node": current,
+            "to_node": next_node,
+            "time_period_p": selected_p,
+            "period_start_min": Startp[selected_p] if selected_p is not None else None,
+            "period_end_min": Endp[selected_p] if selected_p is not None else None,
+            "period_start_clock": relative_min_to_clock(Startp[selected_p]) if selected_p is not None else None,
+            "period_end_clock": relative_min_to_clock(Endp[selected_p]) if selected_p is not None else None,
+            "travel_time_min": travel_time_min,
+            "departure_min_from_node": Dep[current, v, d].X,
+            "departure_clock_from_node": relative_min_to_clock(Dep[current, v, d].X),
+        }
+
+        if next_node == DEPOT_NAME:
+            row["arrival_min_to_node"] = ReturnTime[v, d].X
+            row["arrival_clock_to_node"] = relative_min_to_clock(ReturnTime[v, d].X)
+        else:
+            row["arrival_min_to_node"] = T[next_node, v, d].X
+            row["arrival_clock_to_node"] = relative_min_to_clock(T[next_node, v, d].X)
+
+        route.append(row)
+
+        sequence += 1
+
+        if next_node == DEPOT_NAME:
+            break
+
+        current = next_node
+
+    return route
+
+# ============================================================
+# 19. CLEAN OUTPUT TABLES
+# ============================================================
+
+if m.SolCount > 0:
+    print("\nÇözüm bulundu.")
+    print("Status:", m.status)
+    print("Objective value:", m.objVal)
+
+    used_vehicle_rows = []
+    route_rows = []
+    arc_rows = []
+    arrival_rows = []
+    lunch_rows = []
+    shipment_rows = []
+    store_summary_rows = []
+    backlog_rows = []
+    load_rows = []
+    vehicle_util_rows = []
+    return_rows = []
+    after12_rows = []
+    demand_debug_rows = []
+    box_info_compare_rows = []
+    optimized_cost_rows = []
+
+    # Used vehicles, return times, and routes
+    for d in D:
+        for v in V:
+            if u[v, d].X > 0.5:
+                used_vehicle_rows.append({
+                    "day": d,
+                    "vehicle": v,
+                    "vehicle_used": 1,
+                    "capacity": CapVehicle[v],
+                    "min_load": minload[v],
+                    "vehicle_use_cost": UseCost[v]
+                })
+
+                return_rows.append({
+                    "day": d,
+                    "vehicle": v,
+                    "return_min": ReturnTime[v, d].X,
+                    "return_clock": relative_min_to_clock(ReturnTime[v, d].X)
+                })
+
+                route = build_route_for_vehicle(v, d)
+                for arc in route:
+                    route_rows.append(arc)
+                    arc_rows.append({
+                        "day": arc["day"],
+                        "vehicle": arc["vehicle"],
+                        "from_node": arc["from_node"],
+                        "to_node": arc["to_node"],
+                        "time_period_p": arc["time_period_p"],
+                        "travel_time_min": arc["travel_time_min"]
+                    })
+
+    # Arrival, departure, lunch, after12
+    for d in D:
+        for v in V:
+            if u[v, d].X > 0.5:
+                for i in stores:
+                    if y[i, v, d].X > 0.5:
+                        arr = T[i, v, d].X
+                        dep = Dep[i, v, d].X
+                        is_lunch = 1 if r[i, v, d].X > 0.5 else 0
+                        is_after12 = 1 if After12[i, v, d].X > 0.5 else 0
+
+                        if is_lunch == 1:
+                            lunch_start = arr
+                            lunch_end = arr + BreakTime
+                            service_start = lunch_end
+                        else:
+                            lunch_start = None
+                            lunch_end = None
+                            service_start = arr
+
+                        arrival_rows.append({
+                            "day": d,
+                            "vehicle": v,
+                            "store": i,
+                            "route_order": ordv[i, v, d].X,
+                            "arrival_min": arr,
+                            "arrival_clock": relative_min_to_clock(arr),
+                            "departure_min": dep,
+                            "departure_clock": relative_min_to_clock(dep),
+                            "time_window_start_min": TWstart[i],
+                            "time_window_start_clock": relative_min_to_clock(TWstart[i]),
+                            "time_window_end_min": TWend[i],
+                            "time_window_end_clock": relative_min_to_clock(TWend[i]),
+                            "service_time_min": ServiceTime[i],
+                            "is_after12_by_model": is_after12,
+                            "is_lunch_store_by_model": is_lunch,
+                            "lunch_start_clock": relative_min_to_clock(lunch_start),
+                            "lunch_end_clock": relative_min_to_clock(lunch_end),
+                            "service_start_clock": relative_min_to_clock(service_start),
+                            "service_end_clock": relative_min_to_clock(dep)
+                        })
+
+                        after12_rows.append({
+                            "day": d,
+                            "vehicle": v,
+                            "store": i,
+                            "route_order": ordv[i, v, d].X,
+                            "arrival_clock": relative_min_to_clock(arr),
+                            "After12": is_after12,
+                            "r_lunch": is_lunch,
+                            "LunchNeed_vehicle_day": int(round(LunchNeed[v, d].X))
+                        })
+
+                        if is_lunch == 1:
+                            lunch_rows.append({
+                                "day": d,
+                                "vehicle": v,
+                                "lunch_store": i,
+                                "route_order": ordv[i, v, d].X,
+                                "arrival_clock": relative_min_to_clock(arr),
+                                "lunch_start": relative_min_to_clock(lunch_start),
+                                "lunch_end": relative_min_to_clock(lunch_end),
+                                "departure_after_service": relative_min_to_clock(dep),
+                                "LunchNeed": int(round(LunchNeed[v, d].X))
+                            })
+
+    # If used vehicle has no lunch, show it explicitly.
+    for d in D:
+        for v in V:
+            if u[v, d].X > 0.5:
+                already = any(row["day"] == d and row["vehicle"] == v for row in lunch_rows)
+                if not already:
+                    lunch_rows.append({
+                        "day": d,
+                        "vehicle": v,
+                        "lunch_store": None,
+                        "route_order": None,
+                        "arrival_clock": None,
+                        "lunch_start": None,
+                        "lunch_end": None,
+                        "departure_after_service": None,
+                        "LunchNeed": int(round(LunchNeed[v, d].X))
+                    })
+
+    # Shipments
+    for d in D:
+        for i in stores:
+            for j in J:
+                for v in V:
+                    qty = ship[i, j, v, d].X
+                    if qty > 1e-6:
+                        shipment_rows.append({
+                            "day": d,
+                            "store": i,
+                            "product": j,
+                            "vehicle": v,
+                            "shipped_quantity": qty,
+                            "demand_quantity": quantity[i, j, d],
+                            "product_volume": vol[j],
+                            "packable": pack[j]
+                        })
+
+    # Store summary, demand debug, and backlog
+    for d in D:
+        for i in stores:
+            total_demand = sum(quantity[i, j, d] for j in J)
+            total_shipped = sum(ship[i, j, v, d].X for j in J for v in V)
+            total_backlog = sum(Back[i, j, d].X for j in J)
+
+            assigned_vehicles = [
+                v for v in V
+                if y[i, v, d].X > 0.5
+            ]
+
+            store_summary_rows.append({
+                "day": d,
+                "store": i,
+                "req_from_visit_requirement": req[(i, d)],
+                "assigned_vehicle": ", ".join(assigned_vehicles) if assigned_vehicles else None,
+                "total_demand": total_demand,
+                "total_shipped": total_shipped,
+                "total_backlog": total_backlog
+            })
+
+            demand_debug_rows.append({
+                "day": d,
+                "store": i,
+                "req": req[(i, d)],
+                "total_quantity_input": total_demand,
+                "served_by_model": total_shipped,
+                "backlog_by_model": total_backlog
+            })
+
+            model_total_boxes = sum(boxv[i, v, d].X for v in V)
+            box_info_compare_rows.append({
+                "day": d,
+                "store": i,
+                "box_info_sheet_box_count": box_info.get((i, d), None),
+                "model_total_boxv": model_total_boxes
+            })
+
+            for j in J:
+                qty_back = Back[i, j, d].X
+                if qty_back > 1e-6:
+                    backlog_rows.append({
+                        "day": d,
+                        "store": i,
+                        "product": j,
+                        "backlog_quantity": qty_back,
+                        "demand_quantity": quantity[i, j, d],
+                        "beta_penalty": beta[j]
+                    })
+
+    # Load by store
+    for d in D:
+        for v in V:
+            if u[v, d].X > 0.5:
+                for i in stores:
+                    if y[i, v, d].X > 0.5:
+                        packable_volume = sum(pack[j] * vol[j] * ship[i, j, v, d].X for j in J)
+                        nonpackable_volume = sum((1 - pack[j]) * vol[j] * ship[i, j, v, d].X for j in J)
+                        box_count = boxv[i, v, d].X
+                        box_load = Capbox * box_count
+                        total_store_load = box_load + nonpackable_volume
+
+                        load_rows.append({
+                            "day": d,
+                            "vehicle": v,
+                            "store": i,
+                            "box_count_model": box_count,
+                            "box_capacity_counted_in_vehicle": box_load,
+                            "packable_volume_inside_boxes": packable_volume,
+                            "unused_box_capacity": box_load - packable_volume,
+                            "nonpackable_volume": nonpackable_volume,
+                            "total_store_load_counted": total_store_load
+                        })
+
+    # Vehicle utilization
+    for d in D:
+        for v in V:
+            if u[v, d].X > 0.5:
+                box_load = sum(Capbox * boxv[i, v, d].X for i in stores)
+                nonpack_load = sum(
+                    (1 - pack[j]) * vol[j] * ship[i, j, v, d].X
+                    for i in stores
+                    for j in J
+                )
+                total_load = box_load + nonpack_load
+
+                vehicle_util_rows.append({
+                    "day": d,
+                    "vehicle": v,
+                    "box_load": box_load,
+                    "nonpackable_load": nonpack_load,
+                    "total_load": total_load,
+                    "vehicle_capacity": CapVehicle[v],
+                    "min_load": minload[v],
+                    "utilization_percent": 100 * total_load / CapVehicle[v] if CapVehicle[v] > 0 else 0
+                })
+
+    # Optimized cost summary
+    # This is for reporting/comparison only. It does NOT change the optimization result.
+
+    def get_daily_fixed_cost_tl(v):
+        """Monthly fixed vehicle cost is allocated to daily level for reporting."""
+        if get_vehicle_type(v) == "small":
+            return MONTHLY_FIXED_COST_SMALL_TL / WORKING_DAYS_PER_MONTH
+        else:
+            return MONTHLY_FIXED_COST_LARGE_TL / WORKING_DAYS_PER_MONTH
+
+    vehicle_util_lookup = {
+        (row["day"], row["vehicle"]): row
+        for row in vehicle_util_rows
+    }
+
+    for d in D:
+        used_vs = [v for v in V if u[v, d].X > 0.5]
+
+        daily_fixed_cost_TL = 0
+        daily_driver_cost_TL = 0
+        daily_total_cost_without_fuel_TL = 0
+        daily_working_time_min = 0
+        daily_travel_time_min = 0
+        daily_service_time_min = 0
+        daily_lunch_time_min = 0
+        daily_objective_like_without_backlog = 0
+
+        daily_backlog_quantity = sum(
+            Back[i, j, d].X
+            for i in stores
+            for j in J
+        )
+
+        daily_backlog_penalty_min_equiv = sum(
+            beta[j] * Back[i, j, d].X
+            for i in stores
+            for j in J
+        )
+
+        for v in used_vs:
+            return_min = ReturnTime[v, d].X
+            working_time_min = return_min - StartOfDay
+            working_time_hour = working_time_min / 60
+
+            total_travel_time_min = sum(
+                time[i, k, p] * w[i, k, v, d, p].X
+                for i in nodes
+                for k in nodes
+                if i != k
+                for p in P
+            )
+
+            total_service_time_min = sum(
+                ServiceTime[i] * y[i, v, d].X
+                for i in stores
+            )
+
+            total_lunch_time_min = BreakTime * sum(
+                r[i, v, d].X
+                for i in stores
+            )
+
+            daily_allocated_fixed_cost_TL = get_daily_fixed_cost_tl(v)
+            driver_cost_TL = working_time_min * DRIVER_COST_PER_MIN_TL
+            total_cost_without_fuel_TL = daily_allocated_fixed_cost_TL + driver_cost_TL
+
+            objective_like_value_without_backlog = (
+                lambda_ * total_travel_time_min
+                + UseCost[v] * u[v, d].X
+            )
+
+            util_row = vehicle_util_lookup.get((d, v), {})
+            total_load_value = util_row.get("total_load", None)
+            capacity_value = util_row.get("vehicle_capacity", None)
+            minload_value = util_row.get("min_load", None)
+
+            if total_load_value is not None and capacity_value is not None:
+                capacity_feasible = int(total_load_value <= capacity_value + 1e-6)
+            else:
+                capacity_feasible = None
+
+            if total_load_value is not None and minload_value is not None:
+                minload_feasible = int(total_load_value >= minload_value - 1e-6)
+            else:
+                minload_feasible = None
+
+            optimized_cost_rows.append({
+                "row_type": "VEHICLE",
+                "day": d,
+                "vehicle": v,
+                "route_start_clock": relative_min_to_clock(StartOfDay),
+                "return_min": return_min,
+                "return_clock": relative_min_to_clock(return_min),
+                "working_time_min": working_time_min,
+                "working_time_hour": working_time_hour,
+                "total_travel_time_min": total_travel_time_min,
+                "total_service_time_min": total_service_time_min,
+                "total_lunch_time_min": total_lunch_time_min,
+                "daily_allocated_fixed_cost_TL": daily_allocated_fixed_cost_TL,
+                "driver_cost_TL": driver_cost_TL,
+                "total_cost_without_fuel_TL": total_cost_without_fuel_TL,
+                "objective_like_value_without_backlog": objective_like_value_without_backlog,
+                "backlog_quantity_day": None,
+                "backlog_penalty_min_equiv_day": None,
+                "objective_like_value_with_backlog": None,
+                "capacity_feasible": capacity_feasible,
+                "minload_feasible": minload_feasible,
+                "total_load": total_load_value,
+                "vehicle_capacity": capacity_value,
+                "utilization_percent": util_row.get("utilization_percent", None)
+            })
+
+            daily_fixed_cost_TL += daily_allocated_fixed_cost_TL
+            daily_driver_cost_TL += driver_cost_TL
+            daily_total_cost_without_fuel_TL += total_cost_without_fuel_TL
+            daily_working_time_min += working_time_min
+            daily_travel_time_min += total_travel_time_min
+            daily_service_time_min += total_service_time_min
+            daily_lunch_time_min += total_lunch_time_min
+            daily_objective_like_without_backlog += objective_like_value_without_backlog
+
+        optimized_cost_rows.append({
+            "row_type": "DAY_TOTAL",
+            "day": d,
+            "vehicle": "ALL_USED",
+            "route_start_clock": relative_min_to_clock(StartOfDay),
+            "return_min": None,
+            "return_clock": None,
+            "working_time_min": daily_working_time_min,
+            "working_time_hour": daily_working_time_min / 60,
+            "total_travel_time_min": daily_travel_time_min,
+            "total_service_time_min": daily_service_time_min,
+            "total_lunch_time_min": daily_lunch_time_min,
+            "daily_allocated_fixed_cost_TL": daily_fixed_cost_TL,
+            "driver_cost_TL": daily_driver_cost_TL,
+            "total_cost_without_fuel_TL": daily_total_cost_without_fuel_TL,
+            "objective_like_value_without_backlog": daily_objective_like_without_backlog,
+            "backlog_quantity_day": daily_backlog_quantity,
+            "backlog_penalty_min_equiv_day": daily_backlog_penalty_min_equiv,
+            "objective_like_value_with_backlog": daily_objective_like_without_backlog + daily_backlog_penalty_min_equiv,
+            "capacity_feasible": None,
+            "minload_feasible": None,
+            "total_load": None,
+            "vehicle_capacity": None,
+            "utilization_percent": None
+        })
+
+    # Grand total row for weekly comparison.
+    if len(optimized_cost_rows) > 0:
+        df_cost_temp = pd.DataFrame(optimized_cost_rows)
+        df_day_totals_temp = df_cost_temp[df_cost_temp["row_type"] == "DAY_TOTAL"]
+
+        optimized_cost_rows.append({
+            "row_type": "GRAND_TOTAL",
+            "day": "TOTAL",
+            "vehicle": "ALL_DAYS",
+            "route_start_clock": None,
+            "return_min": None,
+            "return_clock": None,
+            "working_time_min": df_day_totals_temp["working_time_min"].sum(),
+            "working_time_hour": df_day_totals_temp["working_time_hour"].sum(),
+            "total_travel_time_min": df_day_totals_temp["total_travel_time_min"].sum(),
+            "total_service_time_min": df_day_totals_temp["total_service_time_min"].sum(),
+            "total_lunch_time_min": df_day_totals_temp["total_lunch_time_min"].sum(),
+            "daily_allocated_fixed_cost_TL": df_day_totals_temp["daily_allocated_fixed_cost_TL"].sum(),
+            "driver_cost_TL": df_day_totals_temp["driver_cost_TL"].sum(),
+            "total_cost_without_fuel_TL": df_day_totals_temp["total_cost_without_fuel_TL"].sum(),
+            "objective_like_value_without_backlog": df_day_totals_temp["objective_like_value_without_backlog"].sum(),
+            "backlog_quantity_day": df_day_totals_temp["backlog_quantity_day"].sum(),
+            "backlog_penalty_min_equiv_day": df_day_totals_temp["backlog_penalty_min_equiv_day"].sum(),
+            "objective_like_value_with_backlog": df_day_totals_temp["objective_like_value_with_backlog"].sum(),
+            "capacity_feasible": None,
+            "minload_feasible": None,
+            "total_load": None,
+            "vehicle_capacity": None,
+            "utilization_percent": None
+        })
+
+    # DataFrames
+    df_used_vehicles = pd.DataFrame(used_vehicle_rows)
+    df_routes = pd.DataFrame(route_rows)
+    df_arcs = pd.DataFrame(arc_rows)
+    df_arrivals = pd.DataFrame(arrival_rows)
+    df_lunch = pd.DataFrame(lunch_rows)
+    df_shipments = pd.DataFrame(shipment_rows)
+    df_store_summary = pd.DataFrame(store_summary_rows)
+    df_backlog = pd.DataFrame(backlog_rows)
+    df_loads = pd.DataFrame(load_rows)
+    df_vehicle_util = pd.DataFrame(vehicle_util_rows)
+    df_return_times = pd.DataFrame(return_rows)
+    df_after12 = pd.DataFrame(after12_rows)
+    df_demand_debug = pd.DataFrame(demand_debug_rows)
+    df_box_compare = pd.DataFrame(box_info_compare_rows)
+    df_optimized_cost = pd.DataFrame(optimized_cost_rows)
+
+    # Day calendar output: connects internal model_day to real week and original day_id.
+    df_day_calendar = day_calendar[["model_day", "week_sequence", "week_label", "original_day_id", "calendar_label"]].copy()
+
+    def add_calendar_columns(df):
+        """Adds week/day labels to any output table containing a day column."""
+        if df is None or df.empty or "day" not in df.columns:
+            return df
+        out = df.copy()
+        out["_merge_day"] = pd.to_numeric(out["day"], errors="coerce")
+        out = out.merge(df_day_calendar, left_on="_merge_day", right_on="model_day", how="left")
+        out = out.drop(columns=["_merge_day"])
+        return out
+
+    # Add real week/day labels to all day-based output tables.
+    for _name in [
+        "df_used_vehicles", "df_routes", "df_arcs", "df_arrivals", "df_lunch",
+        "df_shipments", "df_store_summary", "df_backlog", "df_loads",
+        "df_vehicle_util", "df_return_times", "df_after12", "df_demand_debug",
+        "df_box_compare", "df_optimized_cost"
+    ]:
+        locals()[_name] = add_calendar_columns(locals()[_name])
+
+    df_model_parameters = pd.DataFrame([
+        {
+            "parameter": "lambda_",
+            "value": lambda_,
+            "meaning": "1 minute of travel time = 1 objective unit"
+        },
+        {
+            "parameter": "beta",
+            "value": f"product-specific from {BETA_SOURCE}; min={min(beta.values())}, max={max(beta.values())}",
+            "meaning": "Product-specific backlog penalty beta_j used in objective"
+        },
+        {
+            "parameter": "V1 UseCost",
+            "value": UseCost.get("V1", None),
+            "meaning": "Final selected objective use cost for small vehicle"
+        },
+        {
+            "parameter": "V2 UseCost",
+            "value": UseCost.get("V2", None),
+            "meaning": "Final selected objective use cost for small vehicle"
+        },
+        {
+            "parameter": "V3 UseCost",
+            "value": UseCost.get("V3", None),
+            "meaning": "Final selected objective use cost for large vehicle"
+        },
+        {
+            "parameter": "V4 UseCost",
+            "value": UseCost.get("V4", None),
+            "meaning": "Final selected objective use cost for large vehicle"
+        },
+        {
+            "parameter": "Monthly fixed cost small",
+            "value": MONTHLY_FIXED_COST_SMALL_TL,
+            "meaning": "TL/month, converted before objective"
+        },
+        {
+            "parameter": "Monthly fixed cost large",
+            "value": MONTHLY_FIXED_COST_LARGE_TL,
+            "meaning": "TL/month, converted before objective"
+        },
+        {
+            "parameter": "Working days per month",
+            "value": WORKING_DAYS_PER_MONTH,
+            "meaning": "Used to convert monthly fixed cost to daily fixed cost"
+        },
+        {
+            "parameter": "Driver hourly cost",
+            "value": DRIVER_HOURLY_COST_TL,
+            "meaning": "TL/hour, used only for converting fixed cost to minute-equivalent"
+        },
+        {
+            "parameter": "selected_weeks",
+            "value": ", ".join([pd.Timestamp(x).strftime("%Y-%m-%d") for x in selected_week_values]),
+            "meaning": "First two week values selected from vrp_input_product_based sheet"
+        },
+        {
+            "parameter": "number_of_model_days",
+            "value": NUMBER_OF_WORKING_DAYS_IN_TEST,
+            "meaning": "Number of selected week-day combinations in the planning horizon"
+        },
+        {
+            "parameter": "Mtime",
+            "value": Mtime,
+            "meaning": "Big-M used for time-related conditional constraints"
+        },
+        {
+            "parameter": "Mreturn",
+            "value": Mreturn,
+            "meaning": "Big-M used for depot return time constraints"
+        },
+        {
+            "parameter": "Mship",
+            "value": Mship,
+            "meaning": "Big-M used for shipment linking constraints"
+        },
+        {
+            "parameter": "MboxCount",
+            "value": MboxCount,
+            "meaning": "Big-M used for box count linking constraints"
+        },
+        {
+            "parameter": "MboxVolume",
+            "value": MboxVolume,
+            "meaning": "Big-M used for box tightening volume constraint"
+        },
+        {
+            "parameter": "time_limit",
+            "value": "No time limit",
+            "meaning": "No Gurobi TimeLimit parameter is set"
+        }
+    ])
+
+
+
+    # ============================================================
+    # 20. OPTIMIZED-ONLY SUMMARY AND OUTPUT EXCEL
+    # ============================================================
+
+    df_parameter_check = pd.DataFrame([
+        {"parameter": "lambda_", "expected_value": 1, "actual_value": lambda_, "check": "OK" if abs(lambda_ - 1) < 1e-9 else "CHECK"},
+        {"parameter": "V1 UseCost", "expected_value": 122.73, "actual_value": UseCost.get("V1", None), "check": "OK" if abs(UseCost.get("V1", 0) - 122.73) < 1e-6 else "CHECK"},
+        {"parameter": "V2 UseCost", "expected_value": 122.73, "actual_value": UseCost.get("V2", None), "check": "OK" if abs(UseCost.get("V2", 0) - 122.73) < 1e-6 else "CHECK"},
+        {"parameter": "V3 UseCost", "expected_value": 253.64, "actual_value": UseCost.get("V3", None), "check": "OK" if abs(UseCost.get("V3", 0) - 253.64) < 1e-6 else "CHECK"},
+        {"parameter": "V4 UseCost", "expected_value": 253.64, "actual_value": UseCost.get("V4", None), "check": "OK" if abs(UseCost.get("V4", 0) - 253.64) < 1e-6 else "CHECK"},
+        {"parameter": "beta_source", "expected_value": "penalty_cost sheet", "actual_value": BETA_SOURCE, "check": "OK" if BETA_SOURCE == "penalty_cost sheet" else "CHECK"},
+        {"parameter": "beta_min", "expected_value": "product-specific", "actual_value": min(beta.values()), "check": "OK"},
+        {"parameter": "beta_max", "expected_value": "product-specific", "actual_value": max(beta.values()), "check": "OK"},
+        {"parameter": "Capbox", "expected_value": 32, "actual_value": Capbox, "check": "OK" if abs(Capbox - 32) < 1e-9 else "CHECK"},
+        {"parameter": "Mtime", "expected_value": "constraint-specific", "actual_value": Mtime, "check": "OK"},
+        {"parameter": "Mreturn", "expected_value": "constraint-specific", "actual_value": Mreturn, "check": "OK"},
+        {"parameter": "Mship", "expected_value": "demand-based", "actual_value": Mship, "check": "OK"},
+        {"parameter": "MboxCount", "expected_value": "box-count-based", "actual_value": MboxCount, "check": "OK"},
+        {"parameter": "MboxVolume", "expected_value": "box-volume-based", "actual_value": MboxVolume, "check": "OK"},
+        {"parameter": "selected_week_count", "expected_value": 2, "actual_value": len(selected_week_values), "check": "OK" if len(selected_week_values) == 2 else "CHECK"},
+        {"parameter": "TimeLimit_sec", "expected_value": "No time limit", "actual_value": "Not set", "check": "OK" if USE_TIME_LIMIT is False else "CHECK"},
+        {"parameter": "MIPGap", "expected_value": "Not set", "actual_value": "Not set" if MIP_GAP is None else MIP_GAP, "check": "OK" if MIP_GAP is None else "CHECK"},
+        {"parameter": "StartOfDay", "expected_value": 0, "actual_value": StartOfDay, "check": "OK" if abs(StartOfDay - 0) < 1e-9 else "CHECK"},
+        {"parameter": "LunchStart", "expected_value": 180, "actual_value
